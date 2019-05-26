@@ -188,7 +188,8 @@ struct mqtt_fixed_header {
     MQTT_ERROR(MQTT_ERROR_SUBSCRIBE_FAILED)              \
     MQTT_ERROR(MQTT_ERROR_CONNECTION_CLOSED)             \
     MQTT_ERROR(MQTT_ERROR_INITIAL_RECONNECT)             \
-    MQTT_ERROR(MQTT_ERROR_INVALID_REMAINING_LENGTH)
+    MQTT_ERROR(MQTT_ERROR_INVALID_REMAINING_LENGTH)      \
+    MQTT_ERROR(MQTT_ERROR_IMPLEMENTATION_BUG)
 
 /* todo: add more connection refused errors */
 
@@ -900,6 +901,7 @@ ssize_t mqtt_pack_disconnect(uint8_t *buf, size_t bufsz);
  */
 enum MQTTQueuedMessageState {
     MQTT_QUEUED_UNSENT,
+    MQTT_QUEUED_SENDING,
     MQTT_QUEUED_AWAITING_ACK,
     MQTT_QUEUED_COMPLETE
 };
@@ -1181,6 +1183,21 @@ struct mqtt_client {
     void* reconnect_state;
 
     /**
+     * @brief A callback that is called to set the ping timer.
+     */
+    void (*set_ping_timer)(struct mqtt_client*, mqtt_pal_time_t t);
+
+    /**
+     * @brief A callback that is called to set the ack timer.
+     */
+    void (*set_ack_timeout)(struct mqtt_client*, mqtt_pal_time_t t);
+
+    /**
+     * @brief A callback that is called to configure sendready notifications.
+     */
+    void (*enable_sendready_event)(struct mqtt_client*, int enabled);
+
+    /**
      * @brief The buffer where ingress data is temporarily stored.
      */
     struct {
@@ -1207,6 +1224,9 @@ struct mqtt_client {
 
     /** @brief The sending message queue. */
     struct mqtt_message_queue mq;
+
+    /** @brief The number of data already sent using a partial write of a message */
+    size_t msg_sending_offset;
 };
 
 /**
@@ -1240,6 +1260,46 @@ ssize_t __mqtt_send(struct mqtt_client *client);
  * @returns MQTT_OK upon success, an \ref MQTTErrors otherwise. 
  */
 ssize_t __mqtt_recv(struct mqtt_client *client);
+
+/**
+ * @brief Call this when the ping timer has expired.
+ * @ingroup details
+ * 
+ * @param client The MQTT client.
+ * 
+ * @returns MQTT_OK upon success, an \ref MQTTErrors otherwise. 
+ */
+enum MQTTErrors mqtt_notify_pingtimer(struct mqtt_client *client);
+
+/**
+ * @brief Call this when the ack timer has expired.
+ * @ingroup details
+ * 
+ * @param client The MQTT client.
+ * 
+ * @returns MQTT_OK upon success, an \ref MQTTErrors otherwise. 
+ */
+enum MQTTErrors mqtt_notify_acktimer(struct mqtt_client *client);
+
+/**
+ * @brief Call this when the there's data available.
+ * @ingroup details
+ * 
+ * @param client The MQTT client.
+ * 
+ * @returns MQTT_OK upon success, an \ref MQTTErrors otherwise. 
+ */
+enum MQTTErrors mqtt_notify_recv(struct mqtt_client *client);
+
+/**
+ * @brief Call this when the there's free space in the send-buffer.
+ * @ingroup details
+ * 
+ * @param client The MQTT client.
+ * 
+ * @returns MQTT_OK upon success, an \ref MQTTErrors otherwise. 
+ */
+enum MQTTErrors mqtt_notify_send(struct mqtt_client *client);
 
 /**
  * @brief Function that does the actual sending and receiving of 

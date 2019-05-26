@@ -59,7 +59,7 @@ SOFTWARE.
  *  - \c MQTT_PAL_MUTEX_RELEASE(mtx_pointer) : macro that unlocks the mutex pointed to by 
  *    \c mtx_pointer.
  * 
- * Lastly, \ref mqtt_pal_sendall and \ref mqtt_pal_recvall, must be implemented in mqtt_pal.c 
+ * Lastly, \ref mqtt_pal_send and \ref mqtt_pal_recv, must be implemented in mqtt_pal.c 
  * for sending and receiving data using the platforms socket calls.
  */
 
@@ -106,7 +106,7 @@ SOFTWARE.
  * 
  * @returns The number of bytes sent if successful, an \ref MQTTErrors otherwise.
  */
-ssize_t mqtt_pal_sendall(mqtt_pal_socket_handle fd, const void* buf, size_t len, int flags);
+ssize_t mqtt_pal_send(mqtt_pal_socket_handle fd, const void* buf, size_t len, int flags);
 
 /**
  * @brief Non-blocking receive all the byte available.
@@ -119,6 +119,6 @@ ssize_t mqtt_pal_sendall(mqtt_pal_socket_handle fd, const void* buf, size_t len,
  * 
  * @returns The number of bytes received if successful, an \ref MQTTErrors otherwise.
  */
-ssize_t mqtt_pal_recvall(mqtt_pal_socket_handle fd, void* buf, size_t bufsz, int flags);
+ssize_t mqtt_pal_recv(mqtt_pal_socket_handle fd, void* buf, size_t bufsz, int flags);
 
 #endif

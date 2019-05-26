@@ -32,7 +32,7 @@ SOFTWARE.
  * @cond Doxygen_Suppress
  */
 
-enum MQTTErrors mqtt_sync(struct mqtt_client *client) {
+void __mqtt_error_recovery(struct mqtt_client *client) {
     /* Recover from any errors */
     enum MQTTErrors err;
     MQTT_PAL_MUTEX_LOCK(&client->mutex);
@@ -42,6 +42,67 @@ enum MQTTErrors mqtt_sync(struct mqtt_client *client) {
     } else {
         MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
     }
+}
+
+mqtt_pal_time_t __mqtt_calc_keepalive_timeout(struct mqtt_client *client) {
+    return client->time_of_last_send + (mqtt_pal_time_t)((float)(client->keep_alive) * 0.75);
+}
+
+void __mqtt_update_ping_timer(struct mqtt_client *client) {
+    if (client->set_ping_timer) {
+        client->set_ping_timer(client, client->time_of_last_send ? __mqtt_calc_keepalive_timeout(client) : 0);
+    }
+}
+
+void __mqtt_update_ack_timer(struct mqtt_client *client) {
+    if (client->set_ack_timeout) {
+        int i = 0;
+        ssize_t len = mqtt_mq_length(&client->mq);
+        mqtt_pal_time_t t = 0;
+
+        /* loop through all messages in the queue */
+        for(; i < len; ++i) {
+            struct mqtt_queued_message *msg = mqtt_mq_get(&client->mq, i);
+
+            if (msg->state == MQTT_QUEUED_SENDING) {
+                /* while sending another message we can't resend any other packages */
+                t = 0;
+                break;
+            }
+            else if (msg->state == MQTT_QUEUED_AWAITING_ACK) {
+                if (t == 0 || msg->time_sent < t)
+                    t = msg->time_sent;
+            }
+        }
+
+        client->set_ack_timeout(client, t ? t + client->response_timeout : 0);
+    }
+}
+
+enum MQTTErrors mqtt_notify_pingtimer(struct mqtt_client *client) {
+    __mqtt_error_recovery(client);
+    return __mqtt_ping(client);
+}
+
+enum MQTTErrors mqtt_notify_acktimer(struct mqtt_client *client) {
+    __mqtt_error_recovery(client);
+    return __mqtt_send(client);
+}
+
+enum MQTTErrors mqtt_notify_recv(struct mqtt_client *client) {
+    __mqtt_error_recovery(client);
+    return __mqtt_recv(client);
+}
+
+enum MQTTErrors mqtt_notify_send(struct mqtt_client *client) {
+    __mqtt_error_recovery(client);
+    return __mqtt_send(client);
+}
+
+enum MQTTErrors mqtt_sync(struct mqtt_client *client) {
+    enum MQTTErrors err;
+
+    __mqtt_error_recovery(client);
 
     /* Call inspector callback if necessary */
     
@@ -58,7 +119,24 @@ enum MQTTErrors mqtt_sync(struct mqtt_client *client) {
 
     /* Call send */
     err = __mqtt_send(client);
-    return err;
+    if (err != MQTT_OK) return err;
+
+    /* check for keep-alive */
+    MQTT_PAL_MUTEX_LOCK(&client->mutex);
+    {
+        mqtt_pal_time_t keep_alive_timeout = __mqtt_calc_keepalive_timeout(client);
+        if (MQTT_PAL_TIME() > keep_alive_timeout) {
+          ssize_t rv = __mqtt_ping(client);
+          if (rv != MQTT_OK) {
+            client->error = rv;
+            MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
+            return rv;
+          }
+        }
+    }
+    MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
+
+    return MQTT_OK;
 }
 
 uint16_t __mqtt_next_pid(struct mqtt_client *client) {
@@ -119,10 +197,16 @@ enum MQTTErrors mqtt_init(struct mqtt_client *client,
     client->typical_response_time = -1.0;
     client->publish_response_callback = publish_response_callback;
     client->pid_lfsr = 0;
+    client->time_of_last_send = 0;
 
     client->inspector_callback = NULL;
     client->reconnect_callback = NULL;
     client->reconnect_state = NULL;
+
+    client->set_ping_timer = NULL;
+    client->set_ack_timeout = NULL;
+    client->enable_sendready_event = NULL;
+    client->msg_sending_offset = 0;
 
     return MQTT_OK;
 }
@@ -204,6 +288,9 @@ void mqtt_reinit(struct mqtt_client* client,
         }                                                           \
     }                                                               \
     msg = mqtt_mq_register(&client->mq, tmp);                       \
+    if (client->enable_sendready_event) {                           \
+        client->enable_sendready_event(client, 1);                  \
+    }                                                               \
 
 
 enum MQTTErrors mqtt_connect(struct mqtt_client *client,
@@ -223,6 +310,7 @@ enum MQTTErrors mqtt_connect(struct mqtt_client *client,
 
     /* update the client's state */
     client->keep_alive = keep_alive;
+    __mqtt_update_ping_timer(client);
     if (client->error == MQTT_ERROR_CONNECT_NOT_CALLED) {
         client->error = MQTT_OK;
     }
@@ -468,12 +556,34 @@ enum MQTTErrors mqtt_disconnect(struct mqtt_client *client)
     return MQTT_OK;
 }
 
+ssize_t __mqtt_do_send(struct mqtt_client *client, const void* buf, size_t len, int flags) {
+    size_t nsent = 0;
+
+    while (len) {
+        ssize_t rv = mqtt_pal_send(client->socketfd, buf, len, flags);
+        if (rv < 0) {
+            return rv;
+        }
+
+        /* short-read because reading further would block */
+        if (client->enable_sendready_event && (size_t)rv != len)
+            break;
+
+        buf += rv;
+        len -= rv;
+        nsent += rv;
+    }
+
+    return nsent;
+}
+
 ssize_t __mqtt_send(struct mqtt_client *client) 
 {
     uint8_t inspected;
     ssize_t len;
     int inflight_qos2 = 0;
     int i = 0;
+    size_t sendoff = 0;
     
     MQTT_PAL_MUTEX_LOCK(&client->mutex);
     
@@ -482,10 +592,33 @@ ssize_t __mqtt_send(struct mqtt_client *client)
         return client->error;
     }
 
-    /* loop through all messages in the queue */
     len = mqtt_mq_length(&client->mq);
+
+    if (client->msg_sending_offset > 0) {
+        sendoff = client->msg_sending_offset;
+        client->msg_sending_offset = 0;
+
+        for(; i < len; ++i) {
+            struct mqtt_queued_message *msg = mqtt_mq_get(&client->mq, i);
+            if (msg->state == MQTT_QUEUED_SENDING)
+                break;
+        }
+
+        /* not found */
+        if (i == len) {
+            client->error = MQTT_ERROR_IMPLEMENTATION_BUG;
+            MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
+            return client->error;
+        }
+    }
+
+    /* loop through all messages in the queue */
     for(; i < len; ++i) {
         struct mqtt_queued_message *msg = mqtt_mq_get(&client->mq, i);
+
+        if (sendoff)
+            goto do_send;
+
         int resend = 0;
         if (msg->state == MQTT_QUEUED_UNSENT) {
             /* message has not been sent to lets send it */
@@ -516,13 +649,36 @@ ssize_t __mqtt_send(struct mqtt_client *client)
             continue;
         }
 
+do_send:
         /* we're sending the message */
         {
-          ssize_t tmp = mqtt_pal_sendall(client->socketfd, msg->start, msg->size, 0);
+          ssize_t tmp = __mqtt_do_send(client, msg->start + sendoff, msg->size - sendoff, 0);
           if (tmp < 0) {
             client->error = tmp;
+            if (sendoff) {
+              client->enable_sendready_event(client, 0);
+            }
             MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
             return tmp;
+          }
+
+          if ((size_t)tmp != msg->size - sendoff) {
+            msg->state = MQTT_QUEUED_SENDING;
+            client->msg_sending_offset = sendoff + tmp;
+
+            if (client->enable_sendready_event) {
+              client->enable_sendready_event(client, 1);
+            }
+
+            __mqtt_update_ack_timer(client);
+
+            MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
+            return MQTT_OK;
+          }
+
+          if (sendoff)  {
+            client->enable_sendready_event(client, 0);
+            sendoff = 0;
           }
         }
 
@@ -579,19 +735,13 @@ ssize_t __mqtt_send(struct mqtt_client *client)
             MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
             return MQTT_ERROR_MALFORMED_REQUEST;
         }
+
+        __mqtt_update_ack_timer(client);
     }
 
-    /* check for keep-alive */
-    {
-        mqtt_pal_time_t keep_alive_timeout = client->time_of_last_send + (mqtt_pal_time_t)((float)(client->keep_alive) * 0.75);
-        if (MQTT_PAL_TIME() > keep_alive_timeout) {
-          ssize_t rv = __mqtt_ping(client);
-          if (rv != MQTT_OK) {
-            client->error = rv;
-            MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
-            return rv;
-          }
-        }
+    __mqtt_update_ping_timer(client);
+    if (client->enable_sendready_event) {
+        client->enable_sendready_event(client, 0);
     }
 
     MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
@@ -609,7 +759,7 @@ ssize_t __mqtt_recv(struct mqtt_client *client)
         ssize_t rv, consumed;
         struct mqtt_queued_message *msg = NULL;
 
-        rv = mqtt_pal_recvall(client->socketfd, client->recv_buffer.curr, client->recv_buffer.curr_sz, 0);
+        rv = mqtt_pal_recv(client->socketfd, client->recv_buffer.curr, client->recv_buffer.curr_sz, 0);
         if (rv < 0) {
             /* an error occurred */
             client->error = rv;
@@ -827,6 +977,9 @@ ssize_t __mqtt_recv(struct mqtt_client *client)
                 MQTT_PAL_MUTEX_UNLOCK(&client->mutex);
                 return MQTT_ERROR_MALFORMED_RESPONSE;
         }
+
+        __mqtt_update_ack_timer(client);
+
         {
           /* we've handled the response, now clean the buffer */
           void* dest = (unsigned char*)client->recv_buffer.mem_start;
@@ -1601,7 +1754,6 @@ void mqtt_mq_clean(struct mqtt_message_queue *mq) {
         size_t removing = new_head->start - (uint8_t*) mq->mem_start;
         memmove(mq->mem_start, new_head->start, n);
         mq->curr = (unsigned char*)mq->mem_start + n;
-      
 
         /* move queue */
         {
